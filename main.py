@@ -172,6 +172,15 @@ BUYERS = [
 ]
 
 
+# Demo farmer lots used for pool aggregation.
+# These are intentionally small sample records for the prototype.
+OPEN_LOTS = [
+    {"id": 101, "farmer_name": "Demo Farmer A", "crop": "Soybean", "quantity_qtl": 30, "latitude": 21.15, "longitude": 79.09},
+    {"id": 102, "farmer_name": "Demo Farmer B", "crop": "Soybean", "quantity_qtl": 25, "latitude": 21.16, "longitude": 79.10},
+    {"id": 103, "farmer_name": "Demo Farmer C", "crop": "Soybean", "quantity_qtl": 20, "latitude": 21.14, "longitude": 79.08},
+    {"id": 104, "farmer_name": "Demo Farmer D", "crop": "Cotton", "quantity_qtl": 35, "latitude": 20.70, "longitude": 77.01},
+]
+
 class RecommendationRequest(BaseModel):
     crop: str = Field(..., description="Supported crop, currently Soybean or Cotton")
     quantity_qtl: float = Field(..., gt=0, description="Harvest quantity in quintals")
@@ -330,6 +339,57 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "krishiq-api"}
 
 
+POOL_RADIUS_KM = 25.0
+
+def pool_candidates(request: RecommendationRequest) -> list[dict]:
+    """Find compatible demo farmer lots within the pool radius."""
+    candidates = []
+    for lot in OPEN_LOTS:
+        if lot["crop"] != request.crop:
+            continue
+        distance = haversine_km(
+            request.latitude, request.longitude,
+            lot["latitude"], lot["longitude"]
+        )
+        if distance <= POOL_RADIUS_KM:
+            candidates.append({
+                **lot,
+                "distance_km": round(distance, 1),
+            })
+    candidates.sort(key=lambda item: item["distance_km"])
+    return candidates
+
+def build_pool_suggestion(request: RecommendationRequest, buyers: list[dict]) -> dict | None:
+    """Build a pool suggestion from the user's lot plus nearby compatible lots."""
+    nearby = pool_candidates(request)
+    if not nearby:
+        return None
+
+    total_quantity = request.quantity_qtl + sum(
+        lot["quantity_qtl"] for lot in nearby
+    )
+
+    # Buyers unlocked by aggregation: buyer accepts the crop and the
+    # combined quantity meets its minimum order.
+    unlocked = []
+    for item in buyers:
+        if item["buyer"]["minimum_order_qtl"] <= total_quantity:
+            unlocked.append({
+                **item["buyer"],
+                "offer_price": item.get("offer_price"),
+            })
+
+    return {
+        "crop": request.crop,
+        "user_quantity_qtl": request.quantity_qtl,
+        "group_quantity_qtl": round(total_quantity, 2),
+        "radius_km": POOL_RADIUS_KM,
+        "candidates": nearby,
+        "unlocked_buyers": unlocked,
+        "message": f"Pool available with {len(nearby)} nearby farmer lot(s).",
+    }
+
+
 @app.post("/recommendations")
 def recommendations(request: RecommendationRequest) -> dict:
     if request.crop not in {crop for mandi in MANDIS for crop in mandi["modal"]}:
@@ -378,6 +438,7 @@ def recommendations(request: RecommendationRequest) -> dict:
         "quality_grade_name": GRADE_NAMES[request.quality_grade],
         "recommendations": mandi_recommendations,
         "buyer_recommendations": buyer_recommendations,
+        "pool_suggestion": build_pool_suggestion(request, buyer_recommendations),
         "cost_assumptions": {
             "truck_capacity_qtl": TRUCK_CAPACITY_QTL,
             "base_truck_cost": BASE_TRUCK_COST,
