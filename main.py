@@ -175,6 +175,13 @@ BUYERS = [
 # Demo farmer lots used for pool aggregation.
 # These are intentionally small sample records for the prototype.
 OPEN_LOTS = [
+    # Indore-area demo lots so the pool feature works during local testing.
+    {"id": 201, "farmer_name": "Indore Farmer A", "crop": "Soybean", "quantity_qtl": 30, "latitude": 22.72, "longitude": 75.86},
+    {"id": 202, "farmer_name": "Indore Farmer B", "crop": "Soybean", "quantity_qtl": 25, "latitude": 22.73, "longitude": 75.87},
+    {"id": 203, "farmer_name": "Indore Farmer C", "crop": "Soybean", "quantity_qtl": 20, "latitude": 22.71, "longitude": 75.85},
+    {"id": 204, "farmer_name": "Indore Farmer D", "crop": "Cotton", "quantity_qtl": 35, "latitude": 22.70, "longitude": 75.88},
+
+    # Existing Maharashtra demo lots.
     {"id": 101, "farmer_name": "Demo Farmer A", "crop": "Soybean", "quantity_qtl": 30, "latitude": 21.15, "longitude": 79.09},
     {"id": 102, "farmer_name": "Demo Farmer B", "crop": "Soybean", "quantity_qtl": 25, "latitude": 21.16, "longitude": 79.10},
     {"id": 103, "farmer_name": "Demo Farmer C", "crop": "Soybean", "quantity_qtl": 20, "latitude": 21.14, "longitude": 79.08},
@@ -359,34 +366,61 @@ def pool_candidates(request: RecommendationRequest) -> list[dict]:
     candidates.sort(key=lambda item: item["distance_km"])
     return candidates
 
-def build_pool_suggestion(request: RecommendationRequest, buyers: list[dict]) -> dict | None:
-    """Build a pool suggestion from the user's lot plus nearby compatible lots."""
+def build_pool_suggestion(
+    request: RecommendationRequest,
+    buyers: list[dict],
+    best_mandi: dict,
+) -> dict | None:
+    """Build a pool payload matching the Krishiq frontend."""
     nearby = pool_candidates(request)
-    if not nearby:
+    if not nearby or request.quantity_qtl >= 70:
         return None
 
-    total_quantity = request.quantity_qtl + sum(
-        lot["quantity_qtl"] for lot in nearby
-    )
+    qty = request.quantity_qtl
+    group_qty = qty + sum(lot["quantity_qtl"] for lot in nearby)
+    all_lots = [{"latitude": request.latitude, "longitude": request.longitude, "quantity_qtl": qty}, *nearby]
 
-    # Buyers unlocked by aggregation: buyer accepts the crop and the
-    # combined quantity meets its minimum order.
+    pool_lat = sum(l["latitude"] * l["quantity_qtl"] for l in all_lots) / group_qty
+    pool_lon = sum(l["longitude"] * l["quantity_qtl"] for l in all_lots) / group_qty
+
+    solo_distance = haversine_km(request.latitude, request.longitude, best_mandi["latitude"], best_mandi["longitude"])
+    pool_distance = haversine_km(pool_lat, pool_lon, best_mandi["latitude"], best_mandi["longitude"])
+
+    grade_price = best_mandi["modal"][request.crop] * GRADE_FACTORS[request.quality_grade]
+    solo_breakdown = financial_breakdown(grade_price, solo_distance, qty)
+    pooled_breakdown = financial_breakdown(grade_price, pool_distance, group_qty)
+
+    pooled_total = pooled_breakdown["estimated_net_price_per_qtl"] * group_qty
+    user_pooled_total = pooled_total * (qty / group_qty)
+    solo_net = solo_breakdown["estimated_net_price_per_qtl"]
+    pooled_net = user_pooled_total / qty
+
     unlocked = []
     for item in buyers:
-        if item["buyer"]["minimum_order_qtl"] <= total_quantity:
+        buyer = item["buyer"]
+        if buyer["minimum_order_qtl"] <= group_qty and buyer["minimum_order_qtl"] > qty:
             unlocked.append({
-                **item["buyer"],
-                "offer_price": item.get("offer_price"),
+                "id": buyer["id"],
+                "name": buyer["name"],
+                "type": buyer["type"],
+                "crops_accepted": [request.crop],
+                "min_order_qty_qtl": buyer["minimum_order_qtl"],
+                "verified_status": buyer["verified_status"],
+                "offer": item.get("offer_price"),
             })
 
     return {
-        "crop": request.crop,
-        "user_quantity_qtl": request.quantity_qtl,
-        "group_quantity_qtl": round(total_quantity, 2),
-        "radius_km": POOL_RADIUS_KM,
-        "candidates": nearby,
+        "solo_net_per_qtl": round(solo_net, 2),
+        "pooled_net_per_qtl": round(pooled_net, 2),
+        "savings_per_qtl": round(pooled_net - solo_net, 2),
+        "group_quantity_qtl": round(group_qty, 2),
+        "group_size": len(nearby) + 1,
+        "pooled_transport_per_qtl": round(pooled_breakdown["transport_cost_per_qtl"], 2),
+        "solo_transport_per_qtl": round(solo_breakdown["transport_cost_per_qtl"], 2),
+        "mandi_distance_km": round(solo_distance, 1),
+        "group": nearby,
         "unlocked_buyers": unlocked,
-        "message": f"Pool available with {len(nearby)} nearby farmer lot(s).",
+        "candidates": nearby,
     }
 
 
@@ -438,7 +472,7 @@ def recommendations(request: RecommendationRequest) -> dict:
         "quality_grade_name": GRADE_NAMES[request.quality_grade],
         "recommendations": mandi_recommendations,
         "buyer_recommendations": buyer_recommendations,
-        "pool_suggestion": build_pool_suggestion(request, buyer_recommendations),
+        "pooling_suggestion": build_pool_suggestion(request, buyer_recommendations, mandi_recommendations[0]["mandi"]),
         "cost_assumptions": {
             "truck_capacity_qtl": TRUCK_CAPACITY_QTL,
             "base_truck_cost": BASE_TRUCK_COST,
